@@ -38,7 +38,7 @@ Ensure the following are installed and configured:
     ```
     The executable will be generated in `target/release/`.
 
-### Configuration
+### Running the Application (Direct Execution)
 
 Create a `.env` file in the project root directory with the following environment variables. Replace placeholders with your specific values.
 
@@ -58,8 +58,6 @@ NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
 - `NERD_BACKUP_VOLUMES_TO_BACKUP`: Comma-separated list of Docker volume names to back up (e.g., `my_app_data,db_data`).
 - `NERD_BACKUP_TAG_PREFIX`: Prefix for Restic snapshot tags (e.g., `daily-`).
 
-### Running the Application
-
 Execute the compiled application:
 
 ```bash
@@ -73,4 +71,66 @@ Upon execution, the application will:
 3.  Back up specified Docker volumes to the Restic repository on S3.
 4.  Output progress and status to the console.
 
-Note that docker volumes are typically stored with only `root` user access on the file system. So chances are, if you run this as a normal user, the backup will fail because the tool cannot access the file system path where the volume files are stored. So you'll typically want to run this as `sudo`.
+Note that Docker volumes are typically stored with only `root` user access on the file system. If running as a non-root user, the backup may fail due to insufficient permissions to access volume files. Running as `sudo` is often required.
+
+## Docker Usage
+
+Alternatively, `nerd-backup` can be run within a Docker container. A `Dockerfile` and `docker-compose.yml` are provided for this purpose.
+
+### Building the Docker Image
+
+From the project root, build the Docker image:
+
+```bash
+docker build -t nerd-backup .
+```
+
+### Running with Docker (Direct Container Execution)
+
+Run the built Docker image as a container, providing environment variables directly:
+
+```bash
+docker run --rm \
+  -e NERD_BACKUP_RESTIC_REPOSITORY="<your_restic_repository_path>" \
+  -e NERD_BACKUP_RESTIC_PASSWORD="<your_restic_password>" \
+  -e NERD_BACKUP_AWS_ACCESS_KEY_ID="<your_aws_access_key_id>" \
+  -e NERD_BACKUP_AWS_SECRET_ACCESS_KEY="<your_aws_secret_access_key>" \
+  -e NERD_BACKUP_VOLUMES_TO_BACKUP="<volume1,volume2>" \
+  -e NERD_BACKUP_TAG_PREFIX="<your_tag_prefix>" \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /var/lib/docker/volumes:/var/lib/docker/volumes:ro \
+  nerd-backup
+```
+
+Replace `<placeholder>` values with your specific configuration.
+
+### Running with Docker Compose (One-Off Job)
+
+Use the provided `docker-compose.yml` to run `nerd-backup` as a one-off job. First, update the environment variable placeholders in `docker-compose.yml`.
+
+```yaml
+version: '3.8'
+
+services:
+  nerd-backup:
+    image: nerd-backup:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/volumes:/var/lib/docker/volumes:ro
+    environment:
+      - NERD_BACKUP_RESTIC_REPOSITORY=<your_restic_repository_path>
+      - NERD_BACKUP_RESTIC_PASSWORD=<your_restic_password>
+      - NERD_BACKUP_AWS_ACCESS_KEY_ID=<your_aws_access_key_id>
+      - NERD_BACKUP_AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
+      - NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
+      - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
+    restart: "no"
+```
+
+From the project root, execute:
+
+```bash
+docker compose up --build nerd-backup
+```
+
+This command will build (if necessary) and run the `nerd-backup` service, executing the backup, and then stopping the container upon completion.
