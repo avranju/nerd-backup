@@ -1,5 +1,7 @@
 # nerd-backup
 
+[![Build and Publish Docker Image](https://github.com/avranju/nerd-backup/actions/workflows/docker_build_and_publish.yml/badge.svg)](https://github.com/avranju/nerd-backup/actions/workflows/docker_build_and_publish.yml)
+
 `nerd-backup` is a Rust application for backing up Docker volumes to an Amazon S3 bucket using [Restic](https://github.com/restic/restic).
 
 ## Overview
@@ -109,8 +111,6 @@ Replace `<placeholder>` values with your specific configuration.
 Use the provided `docker-compose.yml` to run `nerd-backup` as a one-off job. First, update the environment variable placeholders in `docker-compose.yml`.
 
 ```yaml
-version: '3.8'
-
 services:
   nerd-backup:
     image: nerd-backup:latest
