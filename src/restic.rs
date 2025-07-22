@@ -49,7 +49,7 @@ impl Restic {
 
                 let mut cmd = self.build_command();
                 cmd.stdout(Stdio::null()).stderr(Stdio::null()).arg("init");
-                let mut child = cmd.spawn()?;
+                let child = cmd.spawn()?;
                 let output = child.wait_with_output().await?;
 
                 if !output.status.success() {
@@ -72,7 +72,7 @@ impl Restic {
         let mut cmd = self.build_command();
         cmd.stdout(Stdio::null()).stderr(Stdio::null()).arg("check");
 
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
@@ -92,11 +92,11 @@ impl Restic {
             .stderr(Stdio::null())
             .arg("unlock");
 
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
-            let code = output.status.code().unwrap_or(1);
+            output.status.code().unwrap_or(1);
             return Err(Error::Unlock(
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ));
@@ -141,7 +141,7 @@ impl Restic {
             .arg("--tag")
             .arg(format!("{}{}", self.tag_prefix, vol_info.name))
             .arg(vol_info.mountpoint);
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let output = child.wait_with_output().await?;
         if !output.status.success() {
             tracing::error!(

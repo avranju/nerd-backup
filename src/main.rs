@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use anyhow::{Ok, Result};
 use serde::Deserialize;
 use tracing::Level;
