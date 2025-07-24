@@ -9,7 +9,11 @@ use std::{
     result::Result::Ok as StdOk,
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::{Duration as TokioDuration, interval, sleep};
+use tokio::{
+    select,
+    signal::unix,
+    time::{Duration as TokioDuration, interval, sleep},
+};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -103,27 +107,45 @@ async fn main() -> Result<()> {
     // Create a timer that ticks at the specified interval
     let mut interval_timer = interval(duration);
 
+    // Create a future that resolves when a shutdown signal is received
+    let mut sigterm = unix::signal(unix::SignalKind::terminate())?;
+    let mut sigint = unix::signal(unix::SignalKind::interrupt())?;
+
     // Run backup in a loop
     loop {
-        interval_timer.tick().await;
-        tracing::info!("Starting backup.");
+        select! {
+            _ = interval_timer.tick() => {
+                tracing::info!("Starting backup.");
 
-        // Run the backup
-        match restic.backup(config.volumes_to_backup.clone()).await {
-            StdOk(_) => {
-                tracing::info!("Backup completed successfully");
-                // Update the last run timestamp only on success
-                if let Err(e) = update_last_run_timestamp(&last_run_file) {
-                    tracing::error!("Failed to update last run timestamp: {}", e);
+                // Run the backup
+                match restic.backup(config.volumes_to_backup.clone()).await {
+                    StdOk(_) => {
+                        tracing::info!("Backup completed successfully");
+                        // Update the last run timestamp only on success
+                        if let Err(e) = update_last_run_timestamp(&last_run_file) {
+                            tracing::error!("Failed to update last run timestamp: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Backup failed: {}", e);
+                        // Don't update the last run timestamp on failure
+                        // Continue to the next iteration to wait for the next scheduled interval
+                    }
                 }
             }
-            Err(e) => {
-                tracing::error!("Backup failed: {}", e);
-                // Don't update the last run timestamp on failure
-                // Continue to the next iteration to wait for the next scheduled interval
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, shutting down gracefully");
+                break;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, shutting down gracefully");
+                break;
             }
         }
     }
+
+    tracing::info!("Backup service stopped");
+    Ok(())
 }
 
 fn update_last_run_timestamp(file_path: &str) -> Result<()> {

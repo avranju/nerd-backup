@@ -104,6 +104,7 @@ docker run --rm \
   -e NERD_BACKUP_BACKUP_INTERVAL="PT24H" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /var/lib/docker/volumes:/var/lib/docker/volumes:ro \
+  -v nerd-backup-data:/var/lib/nerd-backup \
   nerd-backup
 ```
 
@@ -120,6 +121,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/volumes:/var/lib/docker/volumes:ro
+      - nerd-backup-data:/var/lib/nerd-backup
     environment:
       - NERD_BACKUP_RESTIC_REPOSITORY=<your_restic_repository_path>
       - NERD_BACKUP_RESTIC_PASSWORD=<your_restic_password>
@@ -129,6 +131,9 @@ services:
       - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
       - NERD_BACKUP_BACKUP_INTERVAL=PT24H
     restart: "no"
+
+volumes:
+  nerd-backup-data:
 ```
 
 From the project root, execute:
