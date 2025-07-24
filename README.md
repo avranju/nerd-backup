@@ -51,6 +51,7 @@ NERD_BACKUP_AWS_ACCESS_KEY_ID=<your_aws_access_key_id>
 NERD_BACKUP_AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
 NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
 NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
+NERD_BACKUP_BACKUP_INTERVAL=PT24H
 ```
 
 - `NERD_BACKUP_RESTIC_REPOSITORY`: Full path to the Restic repository (e.g., `s3:s3.ap-south-1.amazonaws.com/nerdworks-backup/vm1`).
@@ -59,6 +60,7 @@ NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
 - `NERD_BACKUP_AWS_SECRET_ACCESS_KEY`: Your AWS Secret Access Key. **Do not share.**
 - `NERD_BACKUP_VOLUMES_TO_BACKUP`: Comma-separated list of Docker volume names to back up (e.g., `my_app_data,db_data`).
 - `NERD_BACKUP_TAG_PREFIX`: Prefix for Restic snapshot tags (e.g., `daily-`).
+- `NERD_BACKUP_BACKUP_INTERVAL`: Interval at which backups should be taken specified in ISO 8601 format.
 
 Execute the compiled application:
 
@@ -99,6 +101,7 @@ docker run --rm \
   -e NERD_BACKUP_AWS_SECRET_ACCESS_KEY="<your_aws_secret_access_key>" \
   -e NERD_BACKUP_VOLUMES_TO_BACKUP="<volume1,volume2>" \
   -e NERD_BACKUP_TAG_PREFIX="<your_tag_prefix>" \
+  -e NERD_BACKUP_BACKUP_INTERVAL="PT24H" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /var/lib/docker/volumes:/var/lib/docker/volumes:ro \
   nerd-backup
@@ -124,6 +127,7 @@ services:
       - NERD_BACKUP_AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
       - NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
       - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
+      - NERD_BACKUP_BACKUP_INTERVAL=PT24H
     restart: "no"
 ```
 
