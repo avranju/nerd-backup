@@ -52,6 +52,7 @@ NERD_BACKUP_AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
 NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
 NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
 NERD_BACKUP_BACKUP_INTERVAL=PT24H
+NERD_BACKUP_SNAPSHOT_RETENTION=P3D
 ```
 
 - `NERD_BACKUP_RESTIC_REPOSITORY`: Full path to the Restic repository (e.g., `s3:s3.ap-south-1.amazonaws.com/nerdworks-backup/vm1`).
@@ -61,6 +62,21 @@ NERD_BACKUP_BACKUP_INTERVAL=PT24H
 - `NERD_BACKUP_VOLUMES_TO_BACKUP`: Comma-separated list of Docker volume names to back up (e.g., `my_app_data,db_data`).
 - `NERD_BACKUP_TAG_PREFIX`: Prefix for Restic snapshot tags (e.g., `daily-`).
 - `NERD_BACKUP_BACKUP_INTERVAL`: Interval at which backups should be taken specified in ISO 8601 format.
+- `NERD_BACKUP_SNAPSHOT_RETENTION` (Optional): Duration in ISO 8601 format specifying how long to retain snapshots. Older snapshots will be pruned automatically (e.g., `P3D` for 3 days, `P1W` for 1 week, `P1M` for 1 month). If not specified, no automatic pruning occurs.
+
+### ISO 8601 Duration Format Examples
+
+For both `NERD_BACKUP_BACKUP_INTERVAL` and `NERD_BACKUP_SNAPSHOT_RETENTION`:
+
+- `PT1H` - 1 hour
+- `PT12H` - 12 hours  
+- `P1D` - 1 day
+- `P3D` - 3 days
+- `P1W` - 1 week
+- `P2W` - 2 weeks
+- `P1M` - 1 month
+- `P3M` - 3 months
+- `P1Y` - 1 year
 
 Execute the compiled application:
 
@@ -73,7 +89,8 @@ Upon execution, the application will:
 1.  Load configuration from `.env`.
 2.  Initialize the Restic repository on S3 (if not present).
 3.  Back up specified Docker volumes to the Restic repository on S3.
-4.  Output progress and status to the console.
+4.  Prune old snapshots based on the retention policy (if configured).
+5.  Output progress and status to the console.
 
 Note that Docker volumes are typically stored with only `root` user access on the file system. If running as a non-root user, the backup may fail due to insufficient permissions to access volume files. Running as `sudo` is often required.
 
@@ -102,6 +119,7 @@ docker run --rm \
   -e NERD_BACKUP_VOLUMES_TO_BACKUP="<volume1,volume2>" \
   -e NERD_BACKUP_TAG_PREFIX="<your_tag_prefix>" \
   -e NERD_BACKUP_BACKUP_INTERVAL="PT24H" \
+  -e NERD_BACKUP_SNAPSHOT_RETENTION="P3D" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /var/lib/docker/volumes:/var/lib/docker/volumes:ro \
   -v nerd-backup-data:/var/lib/nerd-backup \
@@ -130,6 +148,7 @@ services:
       - NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
       - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
       - NERD_BACKUP_BACKUP_INTERVAL=PT24H
+      - NERD_BACKUP_SNAPSHOT_RETENTION=P3D
     restart: "no"
 
 volumes:

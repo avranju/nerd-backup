@@ -29,6 +29,7 @@ pub struct Config {
     pub volumes_to_backup: Vec<String>,
     pub tag_prefix: String,
     pub backup_interval: String,
+    pub snapshot_retention: Option<String>,
 }
 
 #[tokio::main]
@@ -65,6 +66,7 @@ async fn main() -> Result<()> {
         config.restic_password,
         backend,
         config.tag_prefix,
+        config.snapshot_retention.clone(),
     );
     restic.init().await?;
 
@@ -121,6 +123,13 @@ async fn main() -> Result<()> {
                 match restic.backup(config.volumes_to_backup.clone()).await {
                     StdOk(_) => {
                         tracing::info!("Backup completed successfully");
+                        
+                        // Prune old snapshots if retention is configured
+                        if let Err(e) = restic.prune_snapshots().await {
+                            tracing::error!("Failed to prune old snapshots: {}", e);
+                            // Don't fail the entire backup process due to prune failure
+                        }
+                        
                         // Update the last run timestamp only on success
                         if let Err(e) = update_last_run_timestamp(&last_run_file) {
                             tracing::error!("Failed to update last run timestamp: {}", e);

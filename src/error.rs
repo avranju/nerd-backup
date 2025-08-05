@@ -32,6 +32,9 @@ pub enum Error {
     #[error("Failed to unlock respository: {0}")]
     Unlock(String),
 
+    #[error("Failed to prune snapshots: {0}")]
+    Prune(String),
+
     #[error("Docker error: {0}")]
     Docker(#[from] bollard::errors::Error),
 }

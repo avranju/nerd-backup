@@ -3,6 +3,7 @@ use std::{collections::HashMap, process::Stdio};
 use bollard::query_parameters::{
     ListContainersOptions, StartContainerOptions, StopContainerOptions,
 };
+use iso8601::Duration;
 use tokio::process::Command;
 
 use crate::error::{CheckError, Error};
@@ -21,15 +22,17 @@ pub struct Restic {
     password: String,
     backend: Backend,
     tag_prefix: String,
+    snapshot_retention: Option<String>,
 }
 
 impl Restic {
-    pub fn new(repository: String, password: String, backend: Backend, tag_prefix: String) -> Self {
+    pub fn new(repository: String, password: String, backend: Backend, tag_prefix: String, snapshot_retention: Option<String>) -> Self {
         Restic {
             repository,
             password,
             backend,
             tag_prefix,
+            snapshot_retention,
         }
     }
 
@@ -158,6 +161,39 @@ impl Restic {
         Ok(())
     }
 
+    #[tracing::instrument]
+    pub async fn prune_snapshots(&self) -> Result<(), Error> {
+        if let Some(retention) = &self.snapshot_retention {
+            tracing::info!("Pruning snapshots older than: {}", retention);
+            
+            // Convert ISO 8601 duration to restic format
+            let restic_duration = convert_iso8601_to_restic_format(retention)
+                .map_err(|e| Error::Prune(format!("Failed to parse retention duration: {}", e)))?;
+            
+            // Use restic forget command with the duration-based retention
+            let mut cmd = self.build_command();
+            cmd.arg("forget")
+                .arg("--prune")
+                .arg("--keep-within")
+                .arg(&restic_duration);
+            
+            let child = cmd.spawn()?;
+            let output = child.wait_with_output().await?;
+            
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr);
+                tracing::error!("Failed to prune snapshots: {}", error_msg);
+                return Err(Error::Prune(error_msg.to_string()));
+            }
+            
+            tracing::info!("Successfully pruned old snapshots");
+        } else {
+            tracing::debug!("No snapshot retention configured, skipping pruning");
+        }
+        
+        Ok(())
+    }
+
     fn build_command(&self) -> Command {
         let mut cmd = Command::new("restic");
         cmd.env("RESTIC_REPOSITORY", &self.repository)
@@ -208,4 +244,33 @@ async fn start_containers(
     }
 
     Ok(())
+}
+
+/// Convert ISO 8601 duration to restic --keep-within format
+/// Examples: P3D -> 3d, P1W -> 7d, P1M -> 30d, P1Y -> 365d
+fn convert_iso8601_to_restic_format(iso_duration: &str) -> Result<String, String> {
+    let duration = iso_duration
+        .parse::<Duration>()
+        .map_err(|e| format!("Invalid ISO 8601 duration: {:?}", e))?;
+    
+    // Convert duration to total days and use restic's day format
+    let std_duration: std::time::Duration = duration.into();
+    let total_days = std_duration.as_secs() / (24 * 60 * 60);
+    
+    if total_days == 0 {
+        // For sub-day durations, convert to hours
+        let total_hours = std_duration.as_secs() / (60 * 60);
+        if total_hours == 0 {
+            // For sub-hour durations, convert to minutes
+            let total_minutes = std_duration.as_secs() / 60;
+            if total_minutes == 0 {
+                return Err("Duration too short (less than 1 minute)".to_string());
+            }
+            Ok(format!("{}m", total_minutes))
+        } else {
+            Ok(format!("{}h", total_hours))
+        }
+    } else {
+        Ok(format!("{}d", total_days))
+    }
 }

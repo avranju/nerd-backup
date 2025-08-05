@@ -13,6 +13,7 @@ services:
       - NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
       - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
       - NERD_BACKUP_BACKUP_INTERVAL=PT24H # ISO 8601 duration format
+      - NERD_BACKUP_SNAPSHOT_RETENTION=P3D # Optional: ISO 8601 duration for snapshot retention
     restart: unless-stopped
     # Use command to override the entrypoint if needed, or rely on ENTRYPOINT from Dockerfile
     # command: ./nerd-backup 
