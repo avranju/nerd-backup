@@ -53,6 +53,8 @@ NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
 NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
 NERD_BACKUP_BACKUP_INTERVAL=PT24H
 NERD_BACKUP_SNAPSHOT_RETENTION=P3D
+NERD_BACKUP_MAINTENANCE_MARKER_DIR=/run/nerd-watch/maintenance
+NERD_BACKUP_MAINTENANCE_MARKER_TTL=PT1H
 ```
 
 - `NERD_BACKUP_RESTIC_REPOSITORY`: Full path to the Restic repository (e.g., `s3:s3.ap-south-1.amazonaws.com/nerdworks-backup/vm1`).
@@ -63,6 +65,8 @@ NERD_BACKUP_SNAPSHOT_RETENTION=P3D
 - `NERD_BACKUP_TAG_PREFIX`: Prefix for Restic snapshot tags (e.g., `daily-`).
 - `NERD_BACKUP_BACKUP_INTERVAL`: Interval at which backups should be taken specified in ISO 8601 format.
 - `NERD_BACKUP_SNAPSHOT_RETENTION` (Optional): Duration in ISO 8601 format specifying how long to retain snapshots. Older snapshots will be pruned automatically (e.g., `P3D` for 3 days, `P1W` for 1 week, `P1M` for 1 month). If not specified, no automatic pruning occurs.
+- `NERD_BACKUP_MAINTENANCE_MARKER_DIR` (Optional): Directory shared with [`nerd-watch`](https://github.com/avranju/nerd-watch) for per-container maintenance markers. When set, `nerd-backup` writes `<container>.json` before stopping a container and deletes it after that container's backup flow completes.
+- `NERD_BACKUP_MAINTENANCE_MARKER_TTL` (Optional): ISO 8601 duration used for marker expiration. Defaults to `PT1H` when `NERD_BACKUP_MAINTENANCE_MARKER_DIR` is configured.
 
 ### ISO 8601 Duration Format Examples
 
@@ -120,13 +124,18 @@ docker run --rm \
   -e NERD_BACKUP_TAG_PREFIX="<your_tag_prefix>" \
   -e NERD_BACKUP_BACKUP_INTERVAL="PT24H" \
   -e NERD_BACKUP_SNAPSHOT_RETENTION="P3D" \
+  -e NERD_BACKUP_MAINTENANCE_MARKER_DIR="/run/nerd-watch/maintenance" \
+  -e NERD_BACKUP_MAINTENANCE_MARKER_TTL="PT1H" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /var/lib/docker/volumes:/var/lib/docker/volumes:ro \
+  -v /run/nerd-watch/maintenance:/run/nerd-watch/maintenance \
   -v nerd-backup-data:/var/lib/nerd-backup \
   nerd-backup
 ```
 
 Replace `<placeholder>` values with your specific configuration.
+
+When using [`nerd-watch`](https://github.com/avranju/nerd-watch), mount the same host directory into both containers and set `NERD_WATCH_MAINTENANCE_DIR` on [`nerd-watch`](https://github.com/avranju/nerd-watch) to that path. For example, mount `/run/nerd-watch/maintenance` into `nerd-backup` as shown above and configure `NERD_WATCH_MAINTENANCE_DIR=/run/nerd-watch/maintenance` for [`nerd-watch`](https://github.com/avranju/nerd-watch).
 
 ### Running with Docker Compose (One-Off Job)
 
@@ -139,6 +148,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/volumes:/var/lib/docker/volumes:ro
+      - /run/nerd-watch/maintenance:/run/nerd-watch/maintenance
       - nerd-backup-data:/var/lib/nerd-backup
     environment:
       - NERD_BACKUP_RESTIC_REPOSITORY=<your_restic_repository_path>
@@ -149,6 +159,8 @@ services:
       - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
       - NERD_BACKUP_BACKUP_INTERVAL=PT24H
       - NERD_BACKUP_SNAPSHOT_RETENTION=P3D
+      - NERD_BACKUP_MAINTENANCE_MARKER_DIR=/run/nerd-watch/maintenance
+      - NERD_BACKUP_MAINTENANCE_MARKER_TTL=PT1H
     restart: "no"
 
 volumes:

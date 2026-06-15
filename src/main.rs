@@ -30,6 +30,8 @@ pub struct Config {
     pub tag_prefix: String,
     pub backup_interval: String,
     pub snapshot_retention: Option<String>,
+    pub maintenance_marker_dir: Option<String>,
+    pub maintenance_marker_ttl: Option<String>,
 }
 
 #[tokio::main]
@@ -57,6 +59,17 @@ async fn main() -> Result<()> {
     let duration = parse_iso8601_duration(&config.backup_interval)?;
     tracing::info!("Backup interval set to: {}", format_duration(duration));
 
+    let maintenance_markers = match config.maintenance_marker_dir.clone() {
+        Some(dir) => {
+            let ttl = match &config.maintenance_marker_ttl {
+                Some(ttl) => parse_iso8601_duration(ttl)?,
+                None => StdDuration::from_secs(60 * 60),
+            };
+            Some(restic::MaintenanceMarkerConfig::new(dir, ttl))
+        }
+        None => None,
+    };
+
     let backend = restic::Backend::S3 {
         access_key_id: config.aws_access_key_id,
         secret_access_key: config.aws_secret_access_key,
@@ -67,6 +80,7 @@ async fn main() -> Result<()> {
         backend,
         config.tag_prefix,
         config.snapshot_retention.clone(),
+        maintenance_markers,
     );
     restic.init().await?;
 
@@ -123,13 +137,13 @@ async fn main() -> Result<()> {
                 match restic.backup(config.volumes_to_backup.clone()).await {
                     StdOk(_) => {
                         tracing::info!("Backup completed successfully");
-                        
+
                         // Prune old snapshots if retention is configured
                         if let Err(e) = restic.prune_snapshots().await {
                             tracing::error!("Failed to prune old snapshots: {}", e);
                             // Don't fail the entire backup process due to prune failure
                         }
-                        
+
                         // Update the last run timestamp only on success
                         if let Err(e) = update_last_run_timestamp(&last_run_file) {
                             tracing::error!("Failed to update last run timestamp: {}", e);

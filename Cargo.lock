@@ -674,6 +674,7 @@ dependencies = [
  "humantime",
  "iso8601",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
