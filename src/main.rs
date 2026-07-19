@@ -30,6 +30,7 @@ pub struct Config {
     pub tag_prefix: String,
     pub backup_interval: String,
     pub snapshot_retention: Option<String>,
+    pub docker_api_timeout: Option<String>,
     pub maintenance_marker_dir: Option<String>,
     pub maintenance_marker_ttl: Option<String>,
 }
@@ -55,9 +56,14 @@ async fn main() -> Result<()> {
 
     let config = envy::prefixed("NERD_BACKUP_").from_env::<Config>()?;
 
-    // Parse the backup interval
+    // Parse the backup interval and Docker API timeout.
     let duration = parse_iso8601_duration(&config.backup_interval)?;
     tracing::info!("Backup interval set to: {}", format_duration(duration));
+    let docker_api_timeout = parse_docker_api_timeout(config.docker_api_timeout.as_deref())?;
+    tracing::info!(
+        "Docker API timeout set to: {}",
+        format_duration(docker_api_timeout)
+    );
 
     let maintenance_markers = match config.maintenance_marker_dir.clone() {
         Some(dir) => {
@@ -80,6 +86,7 @@ async fn main() -> Result<()> {
         backend,
         config.tag_prefix,
         config.snapshot_retention.clone(),
+        docker_api_timeout,
         maintenance_markers,
     );
     restic.init().await?;
@@ -133,26 +140,29 @@ async fn main() -> Result<()> {
             _ = interval_timer.tick() => {
                 tracing::info!("Starting backup.");
 
-                // Run the backup
-                match restic.backup(config.volumes_to_backup.clone()).await {
+                // Run the backup. Snapshot retention is independent of the aggregate
+                // backup result: a failure in one volume must not prevent cleanup of
+                // snapshots created by earlier volumes or previous runs.
+                let backup_result = restic.backup(config.volumes_to_backup.clone()).await;
+
+                if let Err(e) = restic.prune_snapshots().await {
+                    tracing::error!("Failed to prune old snapshots: {}", e);
+                    // Don't fail the entire backup process due to prune failure.
+                }
+
+                match backup_result {
                     StdOk(_) => {
                         tracing::info!("Backup completed successfully");
 
-                        // Prune old snapshots if retention is configured
-                        if let Err(e) = restic.prune_snapshots().await {
-                            tracing::error!("Failed to prune old snapshots: {}", e);
-                            // Don't fail the entire backup process due to prune failure
-                        }
-
-                        // Update the last run timestamp only on success
+                        // Update the last run timestamp only on success.
                         if let Err(e) = update_last_run_timestamp(&last_run_file) {
                             tracing::error!("Failed to update last run timestamp: {}", e);
                         }
                     }
                     Err(e) => {
                         tracing::error!("Backup failed: {}", e);
-                        // Don't update the last run timestamp on failure
-                        // Continue to the next iteration to wait for the next scheduled interval
+                        // Don't update the last run timestamp on failure.
+                        // Continue to the next iteration to wait for the next scheduled interval.
                     }
                 }
             }
@@ -184,4 +194,46 @@ fn parse_iso8601_duration(duration_str: &str) -> Result<TokioDuration> {
         .parse::<Duration>()
         .map_err(|e| anyhow::anyhow!("Failed to parse duration: {:?}", e))?;
     Ok(duration.into())
+}
+
+fn parse_docker_api_timeout(timeout: Option<&str>) -> Result<StdDuration> {
+    // Operators can raise the default for containers that need longer graceful shutdowns.
+    const DEFAULT_TIMEOUT: StdDuration = StdDuration::from_secs(35 * 60);
+
+    let timeout = match timeout {
+        Some(timeout) => parse_iso8601_duration(timeout)?,
+        None => DEFAULT_TIMEOUT,
+    };
+
+    if timeout.is_zero() {
+        anyhow::bail!("Docker API timeout must be greater than zero");
+    }
+
+    Ok(timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_api_timeout_defaults_to_35_minutes() {
+        assert_eq!(
+            parse_docker_api_timeout(None).unwrap(),
+            StdDuration::from_secs(35 * 60)
+        );
+    }
+
+    #[test]
+    fn docker_api_timeout_accepts_iso8601_duration() {
+        assert_eq!(
+            parse_docker_api_timeout(Some("PT45M")).unwrap(),
+            StdDuration::from_secs(45 * 60)
+        );
+    }
+
+    #[test]
+    fn docker_api_timeout_rejects_zero() {
+        assert!(parse_docker_api_timeout(Some("PT0S")).is_err());
+    }
 }

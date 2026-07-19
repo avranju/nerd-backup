@@ -34,6 +34,7 @@ pub struct Restic {
     backend: Backend,
     tag_prefix: String,
     snapshot_retention: Option<String>,
+    docker_api_timeout: StdDuration,
     maintenance_markers: Option<MaintenanceMarkerConfig>,
 }
 
@@ -59,6 +60,7 @@ impl Restic {
         backend: Backend,
         tag_prefix: String,
         snapshot_retention: Option<String>,
+        docker_api_timeout: StdDuration,
         maintenance_markers: Option<MaintenanceMarkerConfig>,
     ) -> Self {
         Restic {
@@ -67,6 +69,7 @@ impl Restic {
             backend,
             tag_prefix,
             snapshot_retention,
+            docker_api_timeout,
             maintenance_markers,
         }
     }
@@ -145,7 +148,11 @@ impl Restic {
 
     #[tracing::instrument]
     pub async fn backup(&self, volumes: Vec<String>) -> Result<(), Error> {
-        let docker = bollard::Docker::connect_with_socket_defaults()?;
+        let docker = bollard::Docker::connect_with_socket(
+            "/var/run/docker.sock",
+            self.docker_api_timeout.as_secs(),
+            bollard::API_DEFAULT_VERSION,
+        )?;
 
         for vol in volumes {
             let vol_info = docker.inspect_volume(&vol).await?;

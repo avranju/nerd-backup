@@ -15,6 +15,7 @@ services:
       - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
       - NERD_BACKUP_BACKUP_INTERVAL=PT24H # ISO 8601 duration format
       - NERD_BACKUP_SNAPSHOT_RETENTION=P3D # Optional: ISO 8601 duration for snapshot retention
+      - NERD_BACKUP_DOCKER_API_TIMEOUT=PT35M # Optional: must exceed container StopTimeout values
       - NERD_BACKUP_MAINTENANCE_MARKER_DIR=/run/nerd-watch/maintenance # Optional: shared with nerd-watch
       - NERD_BACKUP_MAINTENANCE_MARKER_TTL=PT1H # Optional: marker expiration, defaults to PT1H
     restart: unless-stopped
