@@ -15,22 +15,25 @@ use iso8601::Duration;
 use serde::Serialize;
 use tokio::process::Command;
 
-use crate::error::{CheckError, Error};
+use crate::{
+    error::{CheckError, Error},
+    secret::{Secret, redact},
+};
 
 const MAINTENANCE_REASON: &str = "volume backup";
 
 #[derive(Debug, Clone)]
 pub enum Backend {
     S3 {
-        access_key_id: String,
-        secret_access_key: String,
+        access_key_id: Secret,
+        secret_access_key: Secret,
     },
 }
 
 #[derive(Debug)]
 pub struct Restic {
     repository: String,
-    password: String,
+    password: Secret,
     backend: Backend,
     tag_prefix: String,
     snapshot_retention: Option<String>,
@@ -56,7 +59,7 @@ impl MaintenanceMarkerConfig {
 impl Restic {
     pub fn new(
         repository: String,
-        password: String,
+        password: Secret,
         backend: Backend,
         tag_prefix: String,
         snapshot_retention: Option<String>,
@@ -89,14 +92,14 @@ impl Restic {
                 tracing::info!("Initializing new repository at {}", self.repository);
 
                 let mut cmd = self.build_command();
-                cmd.stdout(Stdio::null()).stderr(Stdio::null()).arg("init");
+                cmd.stdout(Stdio::null()).arg("init");
                 let child = cmd.spawn()?;
                 let output = child.wait_with_output().await?;
 
                 if !output.status.success() {
                     tracing::error!(
                         "Failed to initialize repository: {}",
-                        String::from_utf8_lossy(&output.stderr)
+                        self.redact_output(&output.stderr)
                     );
                     return Err(Error::Init);
                 }
@@ -129,18 +132,14 @@ impl Restic {
         tracing::info!("Unlocking repository at {}", self.repository);
 
         let mut cmd = self.build_command();
-        cmd.stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .arg("unlock");
+        cmd.stdout(Stdio::null()).arg("unlock");
 
         let child = cmd.spawn()?;
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             output.status.code().unwrap_or(1);
-            return Err(Error::Unlock(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            return Err(Error::Unlock(self.redact_output(&output.stderr)));
         }
 
         Ok(())
@@ -205,16 +204,11 @@ impl Restic {
             .arg(vol_info.mountpoint);
         let child = cmd.spawn()?;
         let output = child.wait_with_output().await?;
+        self.log_output(&output);
         if !output.status.success() {
-            tracing::error!(
-                "Failed to backup {}: {}",
-                vol_info.name,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return Err(Error::Backup(
-                vol_info.name.clone(),
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            let stderr = self.redact_output(&output.stderr);
+            tracing::error!("Failed to backup {}: {}", vol_info.name, stderr);
+            return Err(Error::Backup(vol_info.name.clone(), stderr));
         }
         tracing::info!("Backup completed for {}", vol_info.name);
         Ok(())
@@ -239,10 +233,11 @@ impl Restic {
             let child = cmd.spawn()?;
             let output = child.wait_with_output().await?;
 
+            self.log_output(&output);
             if !output.status.success() {
-                let error_msg = String::from_utf8_lossy(&output.stderr);
+                let error_msg = self.redact_output(&output.stderr);
                 tracing::error!("Failed to prune snapshots: {}", error_msg);
-                return Err(Error::Prune(error_msg.to_string()));
+                return Err(Error::Prune(error_msg));
             }
 
             tracing::info!("Successfully pruned old snapshots");
@@ -253,18 +248,40 @@ impl Restic {
         Ok(())
     }
 
+    fn redact_output(&self, output: &[u8]) -> String {
+        let Backend::S3 {
+            access_key_id,
+            secret_access_key,
+        } = &self.backend;
+        redact(
+            &String::from_utf8_lossy(output),
+            &[&self.password, access_key_id, secret_access_key],
+        )
+    }
+
+    fn log_output(&self, output: &std::process::Output) {
+        if !output.stdout.is_empty() {
+            tracing::info!("{}", self.redact_output(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            tracing::warn!("{}", self.redact_output(&output.stderr));
+        }
+    }
+
     fn build_command(&self) -> Command {
         let mut cmd = Command::new("restic");
+        // Never inherit output: restic may echo credentials in diagnostics.
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.env("RESTIC_REPOSITORY", &self.repository)
-            .env("RESTIC_PASSWORD", &self.password);
+            .env("RESTIC_PASSWORD", self.password.expose());
 
         match &self.backend {
             Backend::S3 {
                 access_key_id,
                 secret_access_key,
             } => cmd
-                .env("AWS_ACCESS_KEY_ID", access_key_id)
-                .env("AWS_SECRET_ACCESS_KEY", secret_access_key),
+                .env("AWS_ACCESS_KEY_ID", access_key_id.expose())
+                .env("AWS_SECRET_ACCESS_KEY", secret_access_key.expose()),
         };
 
         cmd
@@ -445,6 +462,125 @@ fn convert_iso8601_to_restic_format(iso_duration: &str) -> Result<String, String
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::{
+        os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+        sync::{Arc, Mutex},
+    };
+
+    fn test_restic() -> Restic {
+        Restic::new(
+            "s3:https://example.com/backups".to_string(),
+            "test-restic-password".to_string().into(),
+            Backend::S3 {
+                access_key_id: "test-access-key".to_string().into(),
+                secret_access_key: "test-secret-key".to_string().into(),
+            },
+            "backup-".to_string(),
+            None,
+            StdDuration::from_secs(60),
+            None,
+        )
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tracing_and_command_output_redact_credentials() {
+        let restic = test_restic();
+        let logs = LogBuffer::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Exercise a real instrumented method without invoking restic or Docker.
+        restic.prune_snapshots().await.unwrap();
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"password=test-restic-password key=test-access-key\n".to_vec(),
+            stderr: b"Authentication failed: test-secret-key\n".to_vec(),
+        };
+        restic.log_output(&output);
+        let error = Error::Prune(restic.redact_output(&output.stderr));
+        tracing::error!("{error}");
+
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        for credential in ["test-restic-password", "test-access-key", "test-secret-key"] {
+            assert!(!logs.contains(credential), "credential leaked: {logs}");
+            assert!(!format!("{restic:?}").contains(credential));
+            assert!(!format!("{:?}", restic.backend).contains(credential));
+            assert!(!format!("{error:?}").contains(credential));
+        }
+        assert!(logs.contains("password: [REDACTED]"));
+        assert!(logs.contains("access_key_id: [REDACTED]"));
+        assert!(logs.contains("secret_access_key: [REDACTED]"));
+        assert!(logs.contains("password=[REDACTED] key=[REDACTED]"));
+        assert!(logs.contains("Authentication failed: [REDACTED]"));
+        assert!(logs.contains("s3:https://example.com/backups"));
+    }
+
+    #[test]
+    fn command_environment_receives_unredacted_credentials() {
+        let restic = test_restic();
+        let command = restic.build_command();
+        let env: HashMap<_, _> = command.as_std().get_envs().collect();
+        for (key, value) in [
+            ("RESTIC_REPOSITORY", "s3:https://example.com/backups"),
+            ("RESTIC_PASSWORD", "test-restic-password"),
+            ("AWS_ACCESS_KEY_ID", "test-access-key"),
+            ("AWS_SECRET_ACCESS_KEY", "test-secret-key"),
+        ] {
+            assert_eq!(
+                env[std::ffi::OsStr::new(key)],
+                Some(std::ffi::OsStr::new(value))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn child_output_is_captured_for_redaction() {
+        let dir = temp_test_dir("command-output");
+        let executable = dir.join("restic");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$RESTIC_PASSWORD\" \"$AWS_ACCESS_KEY_ID\"\nprintf '%s\\n' \"$AWS_SECRET_ACCESS_KEY\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let restic = test_restic();
+        let mut command = restic.build_command();
+        // Override only this child's PATH; do not change the test process environment.
+        command.env("PATH", &dir);
+        let output = command.spawn().unwrap().wait_with_output().await.unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(output.stdout, b"test-restic-password\ntest-access-key\n");
+        assert_eq!(output.stderr, b"test-secret-key\n");
+        assert_eq!(
+            restic.redact_output(&output.stdout),
+            "[REDACTED]\n[REDACTED]\n"
+        );
+        assert_eq!(restic.redact_output(&output.stderr), "[REDACTED]\n");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_test_dir(test_name: &str) -> PathBuf {
         let now = SystemTime::now()

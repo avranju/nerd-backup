@@ -19,13 +19,16 @@ use tracing_subscriber::FmtSubscriber;
 
 mod error;
 mod restic;
+mod secret;
+
+use secret::Secret;
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub restic_repository: String,
-    pub restic_password: String,
-    pub aws_access_key_id: String,
-    pub aws_secret_access_key: String,
+    pub restic_password: Secret,
+    pub aws_access_key_id: Secret,
+    pub aws_secret_access_key: Secret,
     pub volumes_to_backup: Vec<String>,
     pub tag_prefix: String,
     pub backup_interval: String,
@@ -215,6 +218,32 @@ fn parse_docker_api_timeout(timeout: Option<&str>) -> Result<StdDuration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_credentials() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "restic_repository": "s3:https://example.com/backups",
+            "restic_password": "test-restic-password",
+            "aws_access_key_id": "test-access-key",
+            "aws_secret_access_key": "test-secret-key",
+            "volumes_to_backup": ["data"],
+            "tag_prefix": "backup-",
+            "backup_interval": "PT1H"
+        }))
+        .unwrap();
+
+        let debug = format!("{config:?}");
+        for credential in [
+            &config.restic_password,
+            &config.aws_access_key_id,
+            &config.aws_secret_access_key,
+        ] {
+            assert!(!debug.contains(credential.expose()));
+        }
+        assert_eq!(debug.matches(secret::REDACTED).count(), 3);
+        assert!(debug.contains("s3:https://example.com/backups"));
+        assert!(debug.contains("backup-"));
+    }
 
     #[test]
     fn docker_api_timeout_defaults_to_35_minutes() {
