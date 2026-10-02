@@ -16,8 +16,10 @@ use serde::Serialize;
 use tokio::process::Command;
 
 use crate::{
+    config::{BackupConsistency, ResticConfig, VolumeBackupConfig},
     error::{CheckError, Error},
     secret::{Secret, redact},
+    shutdown::Shutdown,
 };
 
 const MAINTENANCE_REASON: &str = "volume backup";
@@ -39,6 +41,7 @@ pub struct Restic {
     snapshot_retention: Option<String>,
     docker_api_timeout: StdDuration,
     maintenance_markers: Option<MaintenanceMarkerConfig>,
+    shutdown: Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -58,22 +61,21 @@ impl MaintenanceMarkerConfig {
 
 impl Restic {
     pub fn new(
-        repository: String,
-        password: Secret,
+        config: ResticConfig,
         backend: Backend,
-        tag_prefix: String,
-        snapshot_retention: Option<String>,
         docker_api_timeout: StdDuration,
         maintenance_markers: Option<MaintenanceMarkerConfig>,
+        shutdown: Shutdown,
     ) -> Self {
         Restic {
-            repository,
-            password,
+            repository: config.repository,
+            password: config.password,
             backend,
-            tag_prefix,
-            snapshot_retention,
+            tag_prefix: config.tag_prefix,
+            snapshot_retention: config.snapshot_retention,
             docker_api_timeout,
             maintenance_markers,
+            shutdown,
         }
     }
 
@@ -93,8 +95,7 @@ impl Restic {
 
                 let mut cmd = self.build_command();
                 cmd.stdout(Stdio::null()).arg("init");
-                let child = cmd.spawn()?;
-                let output = child.wait_with_output().await?;
+                let output = run_command(cmd, &self.shutdown).await?;
 
                 if !output.status.success() {
                     tracing::error!(
@@ -116,8 +117,7 @@ impl Restic {
         let mut cmd = self.build_command();
         cmd.stdout(Stdio::null()).stderr(Stdio::null()).arg("check");
 
-        let child = cmd.spawn()?;
-        let output = child.wait_with_output().await?;
+        let output = run_command(cmd, &self.shutdown).await?;
 
         if !output.status.success() {
             let code = output.status.code().unwrap_or(1);
@@ -134,8 +134,7 @@ impl Restic {
         let mut cmd = self.build_command();
         cmd.stdout(Stdio::null()).arg("unlock");
 
-        let child = cmd.spawn()?;
-        let output = child.wait_with_output().await?;
+        let output = run_command(cmd, &self.shutdown).await?;
 
         if !output.status.success() {
             output.status.code().unwrap_or(1);
@@ -146,52 +145,24 @@ impl Restic {
     }
 
     #[tracing::instrument]
-    pub async fn backup(&self, volumes: Vec<String>) -> Result<(), Error> {
+    pub async fn backup(&self, volumes: &[VolumeBackupConfig]) -> Result<(), Error> {
         let docker = bollard::Docker::connect_with_socket(
             "/var/run/docker.sock",
             self.docker_api_timeout.as_secs(),
             bollard::API_DEFAULT_VERSION,
         )?;
-
-        for vol in volumes {
-            let vol_info = docker.inspect_volume(&vol).await?;
-            tracing::info!("Backing up {}", vol_info.name);
-
-            // Find container(s) to which this volume is attached
-            let filters = HashMap::from([("volume".to_string(), vec![vol_info.name.clone()])]);
-            let options = ListContainersOptions {
-                all: true,
-                filters: Some(filters),
-                ..Default::default()
-            };
-            let containers = docker.list_containers(Some(options)).await?;
-
-            let maintenance_markers =
-                MaintenanceMarkers::create(self.maintenance_markers.as_ref(), &containers)?;
-
-            // Stop all containers using this volume
-            if let Err(e) = stop_containers(&docker, &containers).await {
-                maintenance_markers.delete_all_best_effort();
-                return Err(e);
-            }
-
-            let res = self.do_backup(vol_info).await;
-
-            // Start all containers again
-            if let Err(e) = start_containers(&docker, &containers).await {
-                maintenance_markers.delete_all_best_effort();
-                return Err(e);
-            }
-
-            if let Err(e) = maintenance_markers.delete_all() {
-                if res.is_err() {
-                    tracing::warn!("Failed to delete maintenance marker(s): {}", e);
-                } else {
-                    return Err(e);
-                }
-            }
-
-            res?;
+        let operations = DockerBackup {
+            docker,
+            restic: self,
+        };
+        for volume in volumes {
+            backup_volume(
+                &operations,
+                volume,
+                self.maintenance_markers.as_ref(),
+                &self.shutdown,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -202,8 +173,7 @@ impl Restic {
             .arg("--tag")
             .arg(format!("{}{}", self.tag_prefix, vol_info.name))
             .arg(vol_info.mountpoint);
-        let child = cmd.spawn()?;
-        let output = child.wait_with_output().await?;
+        let output = run_command(cmd, &self.shutdown).await?;
         self.log_output(&output);
         if !output.status.success() {
             let stderr = self.redact_output(&output.stderr);
@@ -230,8 +200,7 @@ impl Restic {
                 .arg("--keep-within")
                 .arg(&restic_duration);
 
-            let child = cmd.spawn()?;
-            let output = child.wait_with_output().await?;
+            let output = run_command(cmd, &self.shutdown).await?;
 
             self.log_output(&output);
             if !output.status.success() {
@@ -271,7 +240,9 @@ impl Restic {
     fn build_command(&self) -> Command {
         let mut cmd = Command::new("restic");
         // Never inherit output: restic may echo credentials in diagnostics.
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         cmd.env("RESTIC_REPOSITORY", &self.repository)
             .env("RESTIC_PASSWORD", self.password.expose());
 
@@ -286,6 +257,166 @@ impl Restic {
 
         cmd
     }
+}
+
+// A small operations boundary lets strategy tests verify the actual orchestration
+// without a Docker daemon, live volumes, AWS credentials, or a Restic repository.
+trait BackupOperations {
+    async fn inspect(&self, name: &str) -> Result<bollard::secret::Volume, Error>;
+    async fn consumers(&self, name: &str) -> Result<Vec<bollard::secret::ContainerSummary>, Error>;
+    async fn stop(&self, containers: &[bollard::secret::ContainerSummary]) -> Result<(), Error>;
+    async fn start(&self, containers: &[bollard::secret::ContainerSummary]) -> Result<(), Error>;
+    async fn backup(&self, volume: bollard::secret::Volume) -> Result<(), Error>;
+}
+
+struct DockerBackup<'a> {
+    docker: bollard::Docker,
+    restic: &'a Restic,
+}
+
+impl BackupOperations for DockerBackup<'_> {
+    async fn inspect(&self, name: &str) -> Result<bollard::secret::Volume, Error> {
+        // Inspection is read-only and can be interrupted safely before stopping
+        // any containers or acquiring a filesystem lock.
+        tokio::select! {
+            biased;
+            _ = self.restic.shutdown.cancelled() => Err(Error::Cancelled),
+            volume = self.docker.inspect_volume(name) => Ok(volume?),
+        }
+    }
+    async fn consumers(&self, name: &str) -> Result<Vec<bollard::secret::ContainerSummary>, Error> {
+        let filters = HashMap::from([("volume".to_string(), vec![name.to_owned()])]);
+        let options = ListContainersOptions {
+            all: true,
+            filters: Some(filters),
+            ..Default::default()
+        };
+        tokio::select! {
+            biased;
+            _ = self.restic.shutdown.cancelled() => Err(Error::Cancelled),
+            containers = self.docker.list_containers(Some(options)) => Ok(containers?),
+        }
+    }
+    async fn stop(&self, containers: &[bollard::secret::ContainerSummary]) -> Result<(), Error> {
+        stop_containers(&self.docker, containers).await
+    }
+    async fn start(&self, containers: &[bollard::secret::ContainerSummary]) -> Result<(), Error> {
+        // Cleanup must finish even after shutdown was requested.
+        start_containers(&self.docker, containers).await
+    }
+    async fn backup(&self, volume: bollard::secret::Volume) -> Result<(), Error> {
+        self.restic.do_backup(volume).await
+    }
+}
+
+async fn backup_volume(
+    operations: &impl BackupOperations,
+    config: &VolumeBackupConfig,
+    markers: Option<&MaintenanceMarkerConfig>,
+    shutdown: &Shutdown,
+) -> Result<(), Error> {
+    if shutdown.is_requested() {
+        return Err(Error::Cancelled);
+    }
+    let volume = operations.inspect(&config.name).await?;
+    match &config.consistency {
+        BackupConsistency::StopConsumers => {
+            tracing::info!(volume = %config.name, consistency = "stop-consumers", "Backing up volume");
+            let containers = operations.consumers(&volume.name).await?;
+            if shutdown.is_requested() {
+                return Err(Error::Cancelled);
+            }
+            let maintenance = MaintenanceMarkers::create(markers, &containers)?;
+            if let Err(error) = operations.stop(&containers).await {
+                maintenance.delete_all_best_effort();
+                return Err(error);
+            }
+            let result = operations.backup(volume).await;
+            if let Err(error) = operations.start(&containers).await {
+                maintenance.delete_all_best_effort();
+                return Err(error);
+            }
+            if let Err(error) = maintenance.delete_all() {
+                if result.is_err() {
+                    tracing::warn!("Failed to delete maintenance marker(s): {}", error);
+                } else {
+                    return Err(error);
+                }
+            }
+            result
+        }
+        BackupConsistency::AioBorgLock(aio) => {
+            tracing::info!(volume = %config.name, consistency = "aio-borg-lock", "Backing up volume");
+            let running_volume = operations.inspect(&aio.running_marker_volume).await?;
+            let lock_path = crate::aio::signal_path(&volume.mountpoint, &aio.lockfile)?;
+            let running_path =
+                crate::aio::signal_path(&running_volume.mountpoint, &aio.running_marker_path)?;
+            let mut guard =
+                crate::aio::acquire(&config.name, &lock_path, &running_path, aio, shutdown).await?;
+            // run_command kills and reaps a cancelled Restic child before this
+            // scope can release its AIO lock. Do not select/drop this future.
+            let result = operations.backup(volume).await;
+            if let Err(error) = guard.release() {
+                if result.is_err() {
+                    tracing::warn!(%error, "Failed to release AIO lock after backup failure");
+                } else {
+                    return Err(error.into());
+                }
+            }
+            result
+        }
+    }
+}
+
+async fn run_command(
+    mut command: Command,
+    shutdown: &Shutdown,
+) -> Result<std::process::Output, Error> {
+    if shutdown.is_requested() {
+        return Err(Error::Cancelled);
+    }
+    command.kill_on_drop(true);
+    let mut child = command.spawn()?;
+    // Drain both pipes while waiting; waiting first could deadlock on full pipes.
+    let stdout = tokio::spawn(read_pipe(child.stdout.take()));
+    let stderr = tokio::spawn(read_pipe(child.stderr.take()));
+    let status = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        status = child.wait() => Some(status),
+    };
+    let cancelled = status.is_none();
+    let status = match status {
+        Some(status) => status,
+        None => {
+            tracing::info!("Stopping Restic subprocess for graceful shutdown");
+            // kill() also waits for termination. Keep the AIO guard alive until
+            // this completes, so AIO cannot start while Restic is still reading.
+            if let Err(error) = child.kill().await {
+                tracing::warn!(%error, "Failed to kill Restic; retaining consistency protection until the child exits");
+            }
+            child.wait().await
+        }
+    };
+    let stdout = stdout.await.map_err(std::io::Error::other)??;
+    let stderr = stderr.await.map_err(std::io::Error::other)??;
+    if cancelled {
+        return Err(Error::Cancelled);
+    }
+    Ok(std::process::Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut bytes).await?;
+    }
+    Ok(bytes)
 }
 
 #[derive(Serialize)]
@@ -469,16 +600,19 @@ mod tests {
 
     fn test_restic() -> Restic {
         Restic::new(
-            "s3:https://example.com/backups".to_string(),
-            "test-restic-password".to_string().into(),
+            ResticConfig {
+                repository: "s3:https://example.com/backups".to_string(),
+                password: "test-restic-password".to_string().into(),
+                tag_prefix: "backup-".to_string(),
+                snapshot_retention: None,
+            },
             Backend::S3 {
                 access_key_id: "test-access-key".to_string().into(),
                 secret_access_key: "test-secret-key".to_string().into(),
             },
-            "backup-".to_string(),
-            None,
             StdDuration::from_secs(60),
             None,
+            Shutdown::new(),
         )
     }
 
@@ -679,5 +813,217 @@ mod tests {
         assert!(unrelated.exists());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[derive(Clone, Copy)]
+    enum BackupOutcome {
+        Success,
+        Failure,
+        Cancelled,
+    }
+
+    struct FakeOperations {
+        borg_dir: PathBuf,
+        dump_dir: PathBuf,
+        events: std::cell::RefCell<Vec<String>>,
+        outcome: BackupOutcome,
+        aio: bool,
+        markers: PathBuf,
+    }
+
+    impl BackupOperations for FakeOperations {
+        async fn inspect(&self, name: &str) -> Result<bollard::secret::Volume, Error> {
+            self.events.borrow_mut().push(format!("inspect:{name}"));
+            Ok(bollard::secret::Volume {
+                name: name.to_owned(),
+                mountpoint: if name == "custom-dump" {
+                    &self.dump_dir
+                } else {
+                    &self.borg_dir
+                }
+                .to_string_lossy()
+                .into_owned(),
+                ..Default::default()
+            })
+        }
+        async fn consumers(
+            &self,
+            _: &str,
+        ) -> Result<Vec<bollard::secret::ContainerSummary>, Error> {
+            assert!(!self.aio, "AIO must not even enumerate consumers");
+            self.events.borrow_mut().push("consumers".into());
+            Ok(vec![container("my-app")])
+        }
+        async fn stop(&self, _: &[bollard::secret::ContainerSummary]) -> Result<(), Error> {
+            assert!(!self.aio);
+            assert!(self.markers.join("my-app.json").exists());
+            self.events.borrow_mut().push("stop".into());
+            Ok(())
+        }
+        async fn start(&self, _: &[bollard::secret::ContainerSummary]) -> Result<(), Error> {
+            assert!(!self.aio);
+            assert!(self.markers.join("my-app.json").exists());
+            self.events.borrow_mut().push("start".into());
+            Ok(())
+        }
+        async fn backup(&self, volume: bollard::secret::Volume) -> Result<(), Error> {
+            assert_eq!(PathBuf::from(volume.mountpoint), self.borg_dir);
+            if self.aio {
+                assert!(self.borg_dir.join("aio-lockfile").exists());
+                assert!(!self.dump_dir.join("backup-is-running").exists());
+                assert!(
+                    !self.markers.exists(),
+                    "AIO must not create maintenance markers"
+                );
+            }
+            self.events.borrow_mut().push("backup".into());
+            match self.outcome {
+                BackupOutcome::Success => Ok(()),
+                BackupOutcome::Failure => Err(Error::Backup(volume.name, "test failure".into())),
+                BackupOutcome::Cancelled => Err(Error::Cancelled),
+            }
+        }
+    }
+
+    fn fake_operations(dir: &std::path::Path, aio: bool, outcome: BackupOutcome) -> FakeOperations {
+        let borg_dir = dir.join("borg");
+        let dump_dir = dir.join("dump");
+        fs::create_dir_all(&borg_dir).unwrap();
+        fs::create_dir_all(&dump_dir).unwrap();
+        FakeOperations {
+            borg_dir,
+            dump_dir,
+            markers: dir.join("markers"),
+            events: Default::default(),
+            outcome,
+            aio,
+        }
+    }
+
+    fn aio_volume() -> VolumeBackupConfig {
+        VolumeBackupConfig {
+            name: "custom-borg".into(),
+            consistency: BackupConsistency::AioBorgLock(crate::config::AioBorgLockConfig {
+                lockfile: "aio-lockfile".into(),
+                running_marker_volume: "custom-dump".into(),
+                running_marker_path: "backup-is-running".into(),
+                wait_interval: StdDuration::from_secs(30),
+                wait_timeout: StdDuration::from_secs(60),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn aio_never_stops_or_restarts_consumers_and_releases_lock_on_all_returns() {
+        for outcome in [
+            BackupOutcome::Success,
+            BackupOutcome::Failure,
+            BackupOutcome::Cancelled,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ops = fake_operations(dir.path(), true, outcome);
+            let markers = MaintenanceMarkerConfig::new(&ops.markers, StdDuration::from_secs(3600));
+            let result = backup_volume(&ops, &aio_volume(), Some(&markers), &Shutdown::new()).await;
+            assert_eq!(result.is_ok(), matches!(outcome, BackupOutcome::Success));
+            assert_eq!(
+                *ops.events.borrow(),
+                ["inspect:custom-borg", "inspect:custom-dump", "backup"]
+            );
+            assert!(!ops.borg_dir.join("aio-lockfile").exists());
+            assert!(!ops.markers.exists());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_aio_never_starts_restic_or_touches_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = fake_operations(dir.path(), true, BackupOutcome::Success);
+        fs::write(ops.dump_dir.join("backup-is-running"), "").unwrap();
+        let result = backup_volume(&ops, &aio_volume(), None, &Shutdown::new()).await;
+        assert!(matches!(result, Err(Error::AioTimeout { .. })));
+        assert_eq!(
+            *ops.events.borrow(),
+            ["inspect:custom-borg", "inspect:custom-dump"]
+        );
+        assert!(!ops.borg_dir.join("aio-lockfile").exists());
+    }
+
+    #[tokio::test]
+    async fn stop_consumers_restarts_and_cleans_markers_after_success_failure_or_cancellation() {
+        for outcome in [
+            BackupOutcome::Success,
+            BackupOutcome::Failure,
+            BackupOutcome::Cancelled,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ops = fake_operations(dir.path(), false, outcome);
+            let markers = MaintenanceMarkerConfig::new(&ops.markers, StdDuration::from_secs(3600));
+            let config = VolumeBackupConfig {
+                name: "ordinary".into(),
+                consistency: BackupConsistency::StopConsumers,
+            };
+            let result = backup_volume(&ops, &config, Some(&markers), &Shutdown::new()).await;
+            assert_eq!(result.is_ok(), matches!(outcome, BackupOutcome::Success));
+            assert_eq!(
+                *ops.events.borrow(),
+                ["inspect:ordinary", "consumers", "stop", "backup", "start"]
+            );
+            assert!(!ops.markers.join("my-app.json").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_and_reaps_child_before_aio_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("aio-lockfile");
+        let pid_path = dir.path().join("child.pid");
+        let shutdown = Shutdown::new();
+        let guard = crate::aio::AioLockGuard::try_acquire(&lock_path).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s' \"$$\" > \"$1\"; exec sleep 3600")
+            .arg("test-child")
+            .arg(&pid_path);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let backup = async {
+            let result = run_command(command, &shutdown).await;
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert!(lock_path.exists(), "lock must cover child termination");
+            let pid = fs::read_to_string(&pid_path).unwrap();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "child must be reaped before releasing lock"
+            );
+            drop(guard);
+        };
+        let cancel = async {
+            loop {
+                if fs::read_to_string(&pid_path).is_ok_and(|pid| !pid.is_empty()) {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+            assert!(lock_path.exists());
+            shutdown.request();
+        };
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            tokio::join!(backup, cancel);
+        })
+        .await
+        .unwrap();
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn command_output_drains_both_pipes_and_preserves_exit_status() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf 'stdout'; printf 'stderr' >&2; exit 7");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = run_command(command, &Shutdown::new()).await.unwrap();
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+        assert_eq!(output.status.code(), Some(7));
     }
 }

@@ -2,179 +2,175 @@
 
 [![Build and Publish Docker Image](https://github.com/avranju/nerd-backup/actions/workflows/docker_build_and_publish.yml/badge.svg)](https://github.com/avranju/nerd-backup/actions/workflows/docker_build_and_publish.yml)
 
-`nerd-backup` is a Rust application for backing up Docker volumes to an Amazon S3 bucket using [Restic](https://github.com/restic/restic).
+`nerd-backup` backs up Docker volumes to an Amazon S3 repository using [Restic](https://github.com/restic/restic). Each volume selects a consistency strategy. The service runs immediately when a backup is due, then repeats at the configured interval. `/var/lib/nerd-backup/last-run` records the last fully successful run.
 
-## Overview
+## Configuration
 
-Here's what it does:
+Copy [config.example.toml](config.example.toml) to `/etc/nerd-backup/config.toml`, or choose a path with `NERD_BACKUP_CONFIG=/path/to/config.toml`. Keep the file readable only by the service user: it contains credentials and the Restic password needed for restoration.
 
-- **Docker Volume Backup:** Backs up specified Docker volumes.
-- **Restic Integration:** Utilizes Restic for secure, efficient, and deduplicated backups.
-- **S3 Backend:** Stores backups in an Amazon S3 bucket.
-- **Environment Variable Configuration:** Configures all settings via environment variables.
+```toml
+[restic]
+repository = "s3:s3.ap-south-1.amazonaws.com/example-bucket/server1"
+password = "replace-with-restic-password"
+tag_prefix = "daily-"
+snapshot_retention = "P3D"
 
-## Usage Guide
+[aws]
+access_key_id = "replace-with-access-key"
+secret_access_key = "replace-with-secret-key"
 
-### Prerequisites
+[backup]
+interval = "PT24H"
+docker_api_timeout = "PT35M"
 
-Ensure the following are installed and configured:
+[maintenance]
+marker_dir = "/run/nerd-watch/maintenance"
+marker_ttl = "PT1H"
 
-- **Rust and Cargo:** Install from the [official Rust website](https://www.rust-lang.org/tools/install).
-- **Docker:** You already have persistent services storing data in docker volumes that you want backed up.
-- **Restic:** `nerd-backup` integrates with Restic internally.
-- **AWS S3 bucket:** A bucket for backup storage.
-- **AWS credentials:** An AWS Access Key ID and Secret Access Key with S3 read/write permissions.
+[[volumes]]
+name = "ordinary_volume"
+consistency = "stop-consumers"
 
-### Building the Project
+[[volumes]]
+name = "nextcloud_aio_backupdir"
+consistency = "aio-borg-lock"
 
-1.  **Clone the repository:**
-
-    ```bash
-    git clone https://github.com/avranju/nerd-backup.git
-    cd nerd-backup
-    ```
-
-2.  **Build the application:**
-    ```bash
-    cargo build --release
-    ```
-    The executable will be generated in `target/release/`.
-
-### Running the Application (Direct Execution)
-
-Create a `.env` file in the project root directory with the following environment variables. Replace placeholders with your specific values.
-
-```ini
-NERD_BACKUP_RESTIC_REPOSITORY=<your_restic_repository_path>
-NERD_BACKUP_RESTIC_PASSWORD=<your_restic_password>
-NERD_BACKUP_AWS_ACCESS_KEY_ID=<your_aws_access_key_id>
-NERD_BACKUP_AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
-NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
-NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
-NERD_BACKUP_BACKUP_INTERVAL=PT24H
-NERD_BACKUP_SNAPSHOT_RETENTION=P3D
-NERD_BACKUP_DOCKER_API_TIMEOUT=PT35M
-NERD_BACKUP_MAINTENANCE_MARKER_DIR=/run/nerd-watch/maintenance
-NERD_BACKUP_MAINTENANCE_MARKER_TTL=PT1H
+[volumes.aio]
+lockfile = "borg/aio-lockfile"
+running_marker_volume = "nextcloud_aio_database_dump"
+running_marker_path = "backup-is-running"
+wait_interval = "PT30S"
+wait_timeout = "PT1H"
 ```
 
-- `NERD_BACKUP_RESTIC_REPOSITORY`: Full path to the Restic repository (e.g., `s3:s3.ap-south-1.amazonaws.com/nerdworks-backup/vm1`).
-- `NERD_BACKUP_RESTIC_PASSWORD`: Restic repository password. **Crucial for restores; keep secure.**
-- `NERD_BACKUP_AWS_ACCESS_KEY_ID`: Your AWS Access Key ID.
-- `NERD_BACKUP_AWS_SECRET_ACCESS_KEY`: Your AWS Secret Access Key. **Do not share.**
-- `NERD_BACKUP_VOLUMES_TO_BACKUP`: Comma-separated list of Docker volume names to back up (e.g., `my_app_data,db_data`).
-- `NERD_BACKUP_TAG_PREFIX`: Prefix for Restic snapshot tags (e.g., `daily-`).
-- `NERD_BACKUP_BACKUP_INTERVAL`: Interval at which backups should be taken specified in ISO 8601 format.
-- `NERD_BACKUP_SNAPSHOT_RETENTION` (Optional): Duration in ISO 8601 format specifying how long to retain snapshots. Older snapshots will be pruned automatically (e.g., `P3D` for 3 days, `P1W` for 1 week, `P1M` for 1 month). If not specified, no automatic pruning occurs.
-- `NERD_BACKUP_DOCKER_API_TIMEOUT` (Optional): Docker API request timeout in ISO 8601 format. Defaults to `PT35M` and must exceed the longest `StopTimeout` of any container being backed up.
-- `NERD_BACKUP_MAINTENANCE_MARKER_DIR` (Optional): Directory shared with [`nerd-watch`](https://github.com/avranju/nerd-watch) for per-container maintenance markers. When set, `nerd-backup` writes `<container>.json` before stopping a container and deletes it after that container's backup flow completes.
-- `NERD_BACKUP_MAINTENANCE_MARKER_TTL` (Optional): ISO 8601 duration used for marker expiration. Defaults to `PT1H` when `NERD_BACKUP_MAINTENANCE_MARKER_DIR` is configured.
+`restic`, `aws`, `backup`, and `volumes` are required. Every volume requires a name and consistency strategy; only `aio-borg-lock` requires the adjacent `[volumes.aio]` table. No AIO fields are needed for ordinary volumes. Unknown strategies and missing AIO fields fail during configuration loading.
 
-### ISO 8601 Duration Format Examples
+- `restic.snapshot_retention` is optional. Omit it to disable pruning. The existing Restic `forget --prune --keep-within` behavior and ISO duration conversion are preserved, including whole-day/hour/minute rounding. Snapshot tags remain `<tag_prefix><volume_name>`.
+- `backup.docker_api_timeout` defaults to `PT35M`. Set it above the longest graceful container stop timeout.
+- The entire `maintenance` section is optional. `marker_ttl` defaults to `PT1H`; markers apply only to `stop-consumers`.
+- `interval`, timeouts, polling interval, and marker TTL use ISO 8601 durations and must be positive. Examples: `PT30S`, `PT1H`, `PT24H`, `P3D`.
+- Both AIO paths are relative to their respective Docker volume mountpoints and cannot be empty, absolute, or contain `..`. All AIO fields are required and configurable, including both volume names. The lockfile's parent directory must already exist; nerd-backup does not initialize Borg repositories.
 
-For both `NERD_BACKUP_BACKUP_INTERVAL` and `NERD_BACKUP_SNAPSHOT_RETENTION`:
+Configuration precedence is:
 
-- `PT1H` - 1 hour
-- `PT12H` - 12 hours  
-- `P1D` - 1 day
-- `P3D` - 3 days
-- `P1W` - 1 week
-- `P2W` - 2 weeks
-- `P1M` - 1 month
-- `P3M` - 3 months
-- `P1Y` - 1 year
+1. `NERD_BACKUP_CONFIG`, including when set in `.env`. An unreadable, missing, or invalid explicit file is an error.
+2. `/etc/nerd-backup/config.toml`, if present. An invalid or unreadable default file, including a dangling symlink, is an error.
+3. Legacy `NERD_BACKUP_*` environment variables, only when the default file is absent and no explicit path was set.
 
-Execute the compiled application:
+There is no merging of TOML fields with environment variables. `.env` loading is still supported, and existing process environment values take precedence over `.env` values. There is no CLI path option.
 
-```bash
-./target/release/nerd-backup
+## Consistency strategies
+
+### stop-consumers
+
+For each ordinary volume, nerd-backup inspects it through Docker, lists all attached containers, creates configured nerd-watch maintenance markers, stops the consumers, runs Restic against the mountpoint, restarts the consumers, and removes its maintenance markers. Restart and marker cleanup still run when Restic fails or is cancelled. Existing container selection and stop/start error semantics are preserved, including starting all listed consumers after backup.
+
+Markers contain an RFC 3339 `expires_at` and the reason `volume backup`. Share `maintenance.marker_dir` with [nerd-watch](https://github.com/avranju/nerd-watch), and set `NERD_WATCH_MAINTENANCE_DIR` there to the same directory. Cleanup errors are logged without replacing an existing backup error. A Docker stop/start error still ends the current run.
+
+### aio-borg-lock
+
+For a local Nextcloud AIO Borg backup directory, nerd-backup uses [AIO's external locking protocol](https://github.com/nextcloud/all-in-one#sync-local-backups-regularly-to-another-drive). It resolves both configured volumes through Docker and then:
+
+1. Waits while `backup-is-running` exists in the database dump volume.
+2. Atomically creates `aio-lockfile` with create-if-absent semantics. An existing lock blocks acquisition.
+3. Checks `backup-is-running` again. If it appeared, releases its lock and retries.
+4. Holds its lock through the Restic backup, then releases it.
+
+AIO volumes using this strategy never have consumers listed, stopped, or started, and never receive nerd-watch maintenance markers. Timeout errors identify the target volume, the observed blocker (`aio-lockfile`, `backup-is-running`, or both), and elapsed wait time. Both Docker mountpoints must be absolute, accessible directories. Missing marker parent directories, permission errors, and other filesystem errors fail the acquisition rather than treating inaccessible signals as absent.
+
+For the usual volume mounted at AIO's `/mnt/borgbackup`, the repository lives in `borg/`, so use `lockfile = "borg/aio-lockfile"`. If your volume mountpoint is the repository itself, use `"aio-lockfile"`. Confirm your installation's layout: [AIO's entrypoint](https://github.com/nextcloud/all-in-one/blob/main/Containers/borgbackup/start.sh) defines the repository location and [backup script](https://github.com/nextcloud/all-in-one/blob/main/Containers/borgbackup/backupscript.sh) checks the external lock. This strategy targets AIO's local Borg repository; AIO does not honor that local external lock for a remote Borg backend.
+
+AIO checks the external lock and creates its running marker in separate operations. The second check handles a race observed during acquisition; this remains an advisory protocol, not a true bidirectional mutex. It does not replace AIO's Borg backup mechanism.
+
+The lock contains nerd-backup ownership metadata (PID and creation time), but **no automatic stale-lock deletion** occurs. Unknown, malformed, and old nerd-backup locks all block until timeout. Normal returns, errors, and graceful SIGTERM/SIGINT shutdown release an acquired lock. On cancellation, Restic is killed and reaped before release. Ordinary consumers are restarted before exit; allow sufficient shutdown grace time for Docker operations.
+
+RAII cannot remove locks after SIGKILL, kernel panic, host crash, power loss, or similar termination without destructors. Inspect surviving locks manually and verify that their owner and any AIO backup/restore have stopped before removing a stale lock. Never blindly remove an unknown lock.
+
+## Nextcloud AIO recovery
+
+With this architecture, **AIO's Borg backup directory should normally be the only AIO volume backed up by nerd-backup**. The database dump volume is inspected for its running marker; it does not need an entry in `volumes`. Configure and schedule AIO's own backups first.
+
+This intentionally creates a **Restic backup of a Borg repository**. Borg produces the coherent Nextcloud/AIO restore point. Restic provides off-site storage and retention of that repository; it does not replace Borg or AIO's restore flow. A successful Restic backup cannot make an absent, outdated, or failed AIO restore point current. Keep AIO's backup encryption password available separately from the Restic password.
+
+The recovery chain is:
+
+```text
+Restic/S3
+  -> restore nextcloud_aio_backupdir
+  -> point AIO at restored Borg repo
+  -> use AIO's own restore flow
 ```
 
-Upon execution, the application will:
+Restore into an offline backup directory, preserving the `borg/` layout and permissions. Restic backs up the whole volume, including the coordination lock present during backup. Before pointing AIO at it, inspect and remove that restored nerd-backup-owned `aio-lockfile` while the restored repository is offline and no operation is using it. Then follow [AIO's restore instructions](https://github.com/nextcloud/all-in-one#how-to-restore-a-backup). Do not independently restore live AIO database/data volumes from different Restic snapshots.
 
-1.  Load configuration from `.env`.
-2.  Initialize the Restic repository on S3 (if not present).
-3.  Back up specified Docker volumes to the Restic repository on S3.
-4.  Prune old snapshots based on the retention policy (if configured).
-5.  Output progress and status to the console.
+## Legacy environment migration
 
-Note that Docker volumes are typically stored with only `root` user access on the file system. If running as a non-root user, the backup may fail due to insufficient permissions to access volume files. Running as `sudo` is often required.
+Existing installations continue to work with the variables below when no TOML file is selected or present. All legacy volumes use `stop-consumers`; AIO consistency requires TOML. See [.env.example](.env.example) for a legacy example.
 
-## Docker Usage
+| Legacy variable (prefix `NERD_BACKUP_`) | TOML field |
+| --- | --- |
+| `RESTIC_REPOSITORY` | `restic.repository` |
+| `RESTIC_PASSWORD` | `restic.password` |
+| `AWS_ACCESS_KEY_ID` | `aws.access_key_id` |
+| `AWS_SECRET_ACCESS_KEY` | `aws.secret_access_key` |
+| `VOLUMES_TO_BACKUP` | One `[[volumes]]` entry per comma-separated name |
+| `TAG_PREFIX` | `restic.tag_prefix` |
+| `BACKUP_INTERVAL` | `backup.interval` |
+| `SNAPSHOT_RETENTION` | `restic.snapshot_retention` (optional) |
+| `DOCKER_API_TIMEOUT` | `backup.docker_api_timeout` (optional) |
+| `MAINTENANCE_MARKER_DIR` | `maintenance.marker_dir` (optional) |
+| `MAINTENANCE_MARKER_TTL` | `maintenance.marker_ttl` (optional) |
 
-Alternatively, `nerd-backup` can be run within a Docker container. A `Dockerfile` and `docker-compose.yml` are provided for this purpose.
+After creating the TOML file, remove legacy credential variables from your deployment. Credentials retain their `Secret` redaction in Debug/tracing and subprocess diagnostics. TOML parse errors omit source excerpts to avoid displaying secret values. Protect the file and keep a secure copy of restoration credentials.
 
-### Building the Docker Image
+## Building and running
 
-From the project root, build the Docker image:
+Requires Rust/Cargo, access to a Docker daemon and its volume mountpoints, Restic on `PATH`, an S3 bucket, and AWS credentials with the required repository permissions. Docker volume directories often require root access. The service also needs write access to `/var/lib/nerd-backup`, the configured maintenance directory, and each AIO Borg volume to create/remove its lock.
 
 ```bash
+cargo build --release
+NERD_BACKUP_CONFIG=/path/to/config.toml ./target/release/nerd-backup
+```
+
+Volumes are processed sequentially. As before, a volume failure ends that backup run, but snapshot pruning still occurs independently of backup success. Only a completely successful backup updates `last-run`. Shutdown skips starting further backup/prune work.
+
+## Docker
+
+```bash
+cp config.example.toml config.toml
+chmod 600 config.toml
+# Edit config.toml with credentials and actual volume names.
 docker build -t nerd-backup .
 ```
 
-### Running with Docker (Direct Container Execution)
+The supplied [docker-compose.yml](docker-compose.yml) shows a persistent service using a read-only configuration mount, a read-only Docker volume root, and a writable overlay for the AIO backup volume. For a locally built image, change `image` to `nerd-backup`. Adjust host paths to the actual mountpoints from `docker volume inspect`; Docker may use a different data root or volume driver.
 
-Run the built Docker image as a container, providing environment variables directly:
+```bash
+docker compose up -d
+```
+
+For direct Docker execution:
 
 ```bash
 docker run --rm \
-  -e NERD_BACKUP_RESTIC_REPOSITORY="<your_restic_repository_path>" \
-  -e NERD_BACKUP_RESTIC_PASSWORD="<your_restic_password>" \
-  -e NERD_BACKUP_AWS_ACCESS_KEY_ID="<your_aws_access_key_id>" \
-  -e NERD_BACKUP_AWS_SECRET_ACCESS_KEY="<your_aws_secret_access_key>" \
-  -e NERD_BACKUP_VOLUMES_TO_BACKUP="<volume1,volume2>" \
-  -e NERD_BACKUP_TAG_PREFIX="<your_tag_prefix>" \
-  -e NERD_BACKUP_BACKUP_INTERVAL="PT24H" \
-  -e NERD_BACKUP_SNAPSHOT_RETENTION="P3D" \
-  -e NERD_BACKUP_DOCKER_API_TIMEOUT="PT35M" \
-  -e NERD_BACKUP_MAINTENANCE_MARKER_DIR="/run/nerd-watch/maintenance" \
-  -e NERD_BACKUP_MAINTENANCE_MARKER_TTL="PT1H" \
+  --stop-timeout 2400 \
+  -v "$PWD/config.toml:/etc/nerd-backup/config.toml:ro" \
   -v /var/run/docker.sock:/var/run/docker.sock:ro \
   -v /var/lib/docker/volumes:/var/lib/docker/volumes:ro \
+  -v /var/lib/docker/volumes/nextcloud_aio_backupdir/_data:/var/lib/docker/volumes/nextcloud_aio_backupdir/_data:rw \
   -v /run/nerd-watch/maintenance:/run/nerd-watch/maintenance \
   -v nerd-backup-data:/var/lib/nerd-backup \
   nerd-backup
 ```
 
-Replace `<placeholder>` values with your specific configuration.
+Mountpoints returned by Docker must be visible inside nerd-backup at **the same absolute paths**. Both AIO volumes need to be readable, and the Borg volume must be writable for the lock. A read-only mount of every volume works only for `stop-consumers`. Remove the writable AIO overlay if no AIO strategy is configured. Adjust the shutdown grace period to cover your containers' stop/start times; forced termination can leave stopped consumers and a stale AIO lock.
 
-When using [`nerd-watch`](https://github.com/avranju/nerd-watch), mount the same host directory into both containers and set `NERD_WATCH_MAINTENANCE_DIR` on [`nerd-watch`](https://github.com/avranju/nerd-watch) to that path. For example, mount `/run/nerd-watch/maintenance` into `nerd-backup` as shown above and configure `NERD_WATCH_MAINTENANCE_DIR=/run/nerd-watch/maintenance` for [`nerd-watch`](https://github.com/avranju/nerd-watch).
-
-### Running with Docker Compose (One-Off Job)
-
-Use the provided `docker-compose.yml` to run `nerd-backup` as a one-off job. First, update the environment variable placeholders in `docker-compose.yml`.
-
-```yaml
-services:
-  nerd-backup:
-    image: nerd-backup:latest
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /var/lib/docker/volumes:/var/lib/docker/volumes:ro
-      - /run/nerd-watch/maintenance:/run/nerd-watch/maintenance
-      - nerd-backup-data:/var/lib/nerd-backup
-    environment:
-      - NERD_BACKUP_RESTIC_REPOSITORY=<your_restic_repository_path>
-      - NERD_BACKUP_RESTIC_PASSWORD=<your_restic_password>
-      - NERD_BACKUP_AWS_ACCESS_KEY_ID=<your_aws_access_key_id>
-      - NERD_BACKUP_AWS_SECRET_ACCESS_KEY=<your_aws_secret_access_key>
-      - NERD_BACKUP_VOLUMES_TO_BACKUP=<volume1,volume2,volume3>
-      - NERD_BACKUP_TAG_PREFIX=<your_tag_prefix>
-      - NERD_BACKUP_BACKUP_INTERVAL=PT24H
-      - NERD_BACKUP_SNAPSHOT_RETENTION=P3D
-      - NERD_BACKUP_DOCKER_API_TIMEOUT=PT35M
-      - NERD_BACKUP_MAINTENANCE_MARKER_DIR=/run/nerd-watch/maintenance
-      - NERD_BACKUP_MAINTENANCE_MARKER_TTL=PT1H
-    restart: "no"
-
-volumes:
-  nerd-backup-data:
-```
-
-From the project root, execute:
+## Development checks
 
 ```bash
-docker compose up --build nerd-backup
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-This command will build (if necessary) and run the `nerd-backup` service, executing the backup, and then stopping the container upon completion.
+Tests exercise TOML/legacy migration, credential redaction, atomic lock ownership and cleanup, waiting/timeouts using paused Tokio time, acquisition races, per-strategy container/marker behavior, and child termination before lock release. They do not require Docker or S3.

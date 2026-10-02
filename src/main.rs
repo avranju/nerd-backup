@@ -1,7 +1,6 @@
 use anyhow::{Ok, Result};
 use humantime::format_duration;
 use iso8601::Duration;
-use serde::Deserialize;
 use std::{
     fs,
     io::Write,
@@ -17,26 +16,15 @@ use tokio::{
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
+mod aio;
+mod config;
 mod error;
 mod restic;
 mod secret;
+mod shutdown;
 
-use secret::Secret;
-
-#[derive(Deserialize, Debug)]
-pub struct Config {
-    pub restic_repository: String,
-    pub restic_password: Secret,
-    pub aws_access_key_id: Secret,
-    pub aws_secret_access_key: Secret,
-    pub volumes_to_backup: Vec<String>,
-    pub tag_prefix: String,
-    pub backup_interval: String,
-    pub snapshot_retention: Option<String>,
-    pub docker_api_timeout: Option<String>,
-    pub maintenance_marker_dir: Option<String>,
-    pub maintenance_marker_ttl: Option<String>,
-}
+use config::Config;
+use shutdown::Shutdown;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,6 +36,20 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set global subscriber");
 
+    let config = Config::load()?;
+    let shutdown = Shutdown::new();
+    // Register signals before repository initialization or the initial scheduled wait.
+    let mut sigterm = unix::signal(unix::SignalKind::terminate())?;
+    let mut sigint = unix::signal(unix::SignalKind::interrupt())?;
+    let signal_shutdown = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        select! {
+            _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down gracefully"),
+            _ = sigint.recv() => tracing::info!("Received SIGINT, shutting down gracefully"),
+        }
+        signal_shutdown.request();
+    });
+
     // Check if /var/lib/nerd-backup exists, create if it doesn't
     let backup_dir = "/var/lib/nerd-backup";
     if !Path::new(backup_dir).exists() {
@@ -57,42 +59,44 @@ async fn main() -> Result<()> {
         tracing::info!("Directory already exists: {}", backup_dir);
     }
 
-    let config = envy::prefixed("NERD_BACKUP_").from_env::<Config>()?;
-
     // Parse the backup interval and Docker API timeout.
-    let duration = parse_iso8601_duration(&config.backup_interval)?;
+    let duration = parse_iso8601_duration(&config.backup.interval)?;
     tracing::info!("Backup interval set to: {}", format_duration(duration));
-    let docker_api_timeout = parse_docker_api_timeout(config.docker_api_timeout.as_deref())?;
+    let docker_api_timeout = parse_docker_api_timeout(config.backup.docker_api_timeout.as_deref())?;
     tracing::info!(
         "Docker API timeout set to: {}",
         format_duration(docker_api_timeout)
     );
 
-    let maintenance_markers = match config.maintenance_marker_dir.clone() {
-        Some(dir) => {
-            let ttl = match &config.maintenance_marker_ttl {
+    let maintenance_markers = match &config.maintenance {
+        Some(maintenance) => {
+            let ttl = match &maintenance.marker_ttl {
                 Some(ttl) => parse_iso8601_duration(ttl)?,
                 None => StdDuration::from_secs(60 * 60),
             };
-            Some(restic::MaintenanceMarkerConfig::new(dir, ttl))
+            Some(restic::MaintenanceMarkerConfig::new(
+                &maintenance.marker_dir,
+                ttl,
+            ))
         }
         None => None,
     };
 
     let backend = restic::Backend::S3 {
-        access_key_id: config.aws_access_key_id,
-        secret_access_key: config.aws_secret_access_key,
+        access_key_id: config.aws.access_key_id,
+        secret_access_key: config.aws.secret_access_key,
     };
     let restic = restic::Restic::new(
-        config.restic_repository,
-        config.restic_password,
+        config.restic,
         backend,
-        config.tag_prefix,
-        config.snapshot_retention.clone(),
         docker_api_timeout,
         maintenance_markers,
+        shutdown.clone(),
     );
-    restic.init().await?;
+    match restic.init().await {
+        Err(error::Error::Cancelled) => return Ok(()),
+        result => result?,
+    }
 
     // Check when the last backup was run
     let last_run_file = format!("{}/last-run", backup_dir);
@@ -114,7 +118,11 @@ async fn main() -> Result<()> {
                         "Waiting {} seconds until next scheduled backup",
                         format_duration(StdDuration::from_secs(remaining))
                     );
-                    sleep(TokioDuration::from_secs(remaining)).await;
+                    select! {
+                        biased;
+                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = sleep(TokioDuration::from_secs(remaining)) => {},
+                    }
                 } else {
                     tracing::info!(
                         "Backup is overdue by {} seconds, running immediately",
@@ -133,24 +141,24 @@ async fn main() -> Result<()> {
     // Create a timer that ticks at the specified interval
     let mut interval_timer = interval(duration);
 
-    // Create a future that resolves when a shutdown signal is received
-    let mut sigterm = unix::signal(unix::SignalKind::terminate())?;
-    let mut sigint = unix::signal(unix::SignalKind::interrupt())?;
-
     // Run backup in a loop
     loop {
         select! {
+            biased;
+            _ = shutdown.cancelled() => break,
             _ = interval_timer.tick() => {
                 tracing::info!("Starting backup.");
 
                 // Run the backup. Snapshot retention is independent of the aggregate
                 // backup result: a failure in one volume must not prevent cleanup of
                 // snapshots created by earlier volumes or previous runs.
-                let backup_result = restic.backup(config.volumes_to_backup.clone()).await;
+                let backup_result = restic.backup(&config.volumes).await;
 
-                if let Err(e) = restic.prune_snapshots().await {
+                // Normal backup failures still prune. Shutdown does not start new
+                // maintenance work; cancelled children are already killed/reaped.
+                if !shutdown.is_requested()
+                    && let Err(e) = restic.prune_snapshots().await {
                     tracing::error!("Failed to prune old snapshots: {}", e);
-                    // Don't fail the entire backup process due to prune failure.
                 }
 
                 match backup_result {
@@ -162,6 +170,7 @@ async fn main() -> Result<()> {
                             tracing::error!("Failed to update last run timestamp: {}", e);
                         }
                     }
+                    Err(error::Error::Cancelled) => break,
                     Err(e) => {
                         tracing::error!("Backup failed: {}", e);
                         // Don't update the last run timestamp on failure.
@@ -169,17 +178,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, shutting down gracefully");
-                break;
-            }
-            _ = sigint.recv() => {
-                tracing::info!("Received SIGINT, shutting down gracefully");
-                break;
-            }
         }
     }
 
+    signal_task.abort();
     tracing::info!("Backup service stopped");
     Ok(())
 }
@@ -195,7 +197,7 @@ fn update_last_run_timestamp(file_path: &str) -> Result<()> {
 fn parse_iso8601_duration(duration_str: &str) -> Result<TokioDuration> {
     let duration = duration_str
         .parse::<Duration>()
-        .map_err(|e| anyhow::anyhow!("Failed to parse duration: {:?}", e))?;
+        .map_err(|_| anyhow::anyhow!("Invalid ISO 8601 duration (value omitted)"))?;
     Ok(duration.into())
 }
 
@@ -218,32 +220,6 @@ fn parse_docker_api_timeout(timeout: Option<&str>) -> Result<StdDuration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn config_debug_redacts_credentials() {
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "restic_repository": "s3:https://example.com/backups",
-            "restic_password": "test-restic-password",
-            "aws_access_key_id": "test-access-key",
-            "aws_secret_access_key": "test-secret-key",
-            "volumes_to_backup": ["data"],
-            "tag_prefix": "backup-",
-            "backup_interval": "PT1H"
-        }))
-        .unwrap();
-
-        let debug = format!("{config:?}");
-        for credential in [
-            &config.restic_password,
-            &config.aws_access_key_id,
-            &config.aws_secret_access_key,
-        ] {
-            assert!(!debug.contains(credential.expose()));
-        }
-        assert_eq!(debug.matches(secret::REDACTED).count(), 3);
-        assert!(debug.contains("s3:https://example.com/backups"));
-        assert!(debug.contains("backup-"));
-    }
 
     #[test]
     fn docker_api_timeout_defaults_to_35_minutes() {

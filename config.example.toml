@@ -1,0 +1,35 @@
+[restic]
+repository = "s3:s3.ap-south-1.amazonaws.com/example-bucket/server1"
+password = "replace-with-restic-password"
+tag_prefix = "daily-"
+snapshot_retention = "P3D" # Optional; omit to disable pruning.
+
+[aws]
+access_key_id = "replace-with-access-key"
+secret_access_key = "replace-with-secret-key"
+
+[backup]
+interval = "PT24H"
+docker_api_timeout = "PT35M" # Optional; defaults to PT35M.
+
+# Optional; applies only to stop-consumers volumes.
+[maintenance]
+marker_dir = "/run/nerd-watch/maintenance"
+marker_ttl = "PT1H" # Optional; defaults to PT1H.
+
+[[volumes]]
+name = "ordinary_volume"
+consistency = "stop-consumers"
+
+[[volumes]]
+name = "nextcloud_aio_backupdir"
+consistency = "aio-borg-lock"
+
+[volumes.aio]
+# AIO's local Borg repository normally lives in the volume's borg subdirectory.
+# Use aio-lockfile if the Docker volume mountpoint is the Borg repository itself.
+lockfile = "borg/aio-lockfile"
+running_marker_volume = "nextcloud_aio_database_dump"
+running_marker_path = "backup-is-running"
+wait_interval = "PT30S"
+wait_timeout = "PT1H"

@@ -17,6 +17,16 @@ pub enum CheckError {
 
 #[derive(ThisError, Debug)]
 pub enum Error {
+    #[error("Backup service is shutting down")]
+    Cancelled,
+
+    #[error("Timed out waiting for AIO volume {volume}: blocked by {blocker} after {waited:?}")]
+    AioTimeout {
+        volume: String,
+        blocker: &'static str,
+        waited: std::time::Duration,
+    },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
